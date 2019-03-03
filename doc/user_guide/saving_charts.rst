@@ -51,13 +51,26 @@ Firefox, which requires the following:
 Once those dependencies are installed, you should be able to save charts as
 ``png`` or ``svg``.
 
+Figure Size/Resolution
+^^^^^^^^^^^^^^^^^^^^^^
+When using ``chart.save()`` above, the resolution of the resulting PNG is
+controlled by the resolution of your screen. The easiest way to produce a
+higher-resolution PNG image is to scale the image to make it larger, and thus
+to contain more pixels at a given resolution.
+
+This can be done with the ``scale_factor`` argument, which defaults to 1.0::
+
+    chart.save('chart.png', scale_factor=2.0)
+
 .. saving-json:
 
 JSON format
 ~~~~~~~~~~~
 The fundamental chart representation output by Altair is a JSON string format;
-you can save a chart to a JSON file using :meth:`Chart.save`, by passing
-a filename with a ``.json`` extension.
+one of the core methods provided by Altair is :meth:`Chart.to_json`, which
+returns a JSON string that represents the chart content.
+Additionally, you can save a chart to a JSON file using :meth:`Chart.save`,
+by passing a filename with a ``.json`` extension.
 
 For example, here we save a simple scatter-plot to JSON:
 
@@ -74,7 +87,7 @@ For example, here we save a simple scatter-plot to JSON:
 
     chart.save('chart.json')
 
-The contetns of the resulting file will look something like this:
+The contents of the resulting file will look something like this:
 
 .. code-block:: json
 

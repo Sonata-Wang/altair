@@ -2,13 +2,22 @@ import json
 
 import six
 
-from .core import write_file_or_filename
 from .mimebundle import spec_to_mimebundle
+
+
+def write_file_or_filename(fp, content, mode='w'):
+    """Write content to fp, whether fp is a string or a file-like object"""
+    if isinstance(fp, six.string_types):
+        with open(fp, mode) as f:
+            f.write(content)
+    else:
+        fp.write(content)
 
 
 def save(chart, fp, vega_version, vegaembed_version,
          format=None, mode=None, vegalite_version=None,
-         embed_options=None, json_kwds=None, webdriver='chrome'):
+         embed_options=None, json_kwds=None, webdriver='chrome',
+         scale_factor=1):
     """Save a chart to file in a variety of formats
 
     Supported formats are [json, html, png, svg]
@@ -39,7 +48,9 @@ def save(chart, fp, vega_version, vegaembed_version,
         Additional keyword arguments are passed to the output method
         associated with the specified format.
     webdriver : string {'chrome' | 'firefox'}
-        Webdriver to use.
+        Webdriver to use for png or svg output
+    scale_factor : float
+        scale_factor to use to change size/resolution of png or svg output
     """
     if json_kwds is None:
         json_kwds = {}
@@ -66,7 +77,7 @@ def save(chart, fp, vega_version, vegaembed_version,
 
     if mode not in ['vega', 'vega-lite']:
         raise ValueError("mode must be 'vega' or 'vega-lite', "
-                         "not '{0}'".format(mode))
+                         "not '{}'".format(mode))
 
     if mode == 'vega-lite' and vegalite_version is None:
         raise ValueError("must specify vega-lite version")
@@ -82,15 +93,16 @@ def save(chart, fp, vega_version, vegaembed_version,
                                         embed_options=embed_options,
                                         json_kwds=json_kwds)
         write_file_or_filename(fp, mimebundle['text/html'], mode='w')
-    elif format in ['png', 'svg', 'html']:
+    elif format in ['png', 'svg']:
         mimebundle = spec_to_mimebundle(spec=spec, format=format, mode=mode,
                                         vega_version=vega_version,
                                         vegalite_version=vegalite_version,
                                         vegaembed_version=vegaembed_version,
-                                        webdriver=webdriver)
+                                        webdriver=webdriver,
+                                        scale_factor=scale_factor)
         if format == 'png':
             write_file_or_filename(fp, mimebundle['image/png'], mode='wb')
         else:
             write_file_or_filename(fp, mimebundle['image/svg+xml'], mode='w')
     else:
-        raise ValueError("unrecognized format: '{0}'".format(format))
+        raise ValueError("unrecognized format: '{}'".format(format))

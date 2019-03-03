@@ -4,6 +4,7 @@ import json
 import random
 import collections
 from operator import itemgetter
+import warnings
 
 import jinja2
 
@@ -14,12 +15,13 @@ from docutils.parsers.rst.directives import flag
 
 from sphinx.util.nodes import nested_parse_with_titles
 
-from .utils import get_docstring_and_rest, prev_this_next, create_thumbnail
+from .utils import (get_docstring_and_rest, prev_this_next,
+                    create_thumbnail, create_generic_image)
 from altair.utils.execeval import eval_block
-from altair.vegalite.v2.examples import iter_examples
+from altair.examples import iter_examples
 
 
-EXAMPLE_MODULE = 'altair.vegalite.v2.examples'
+EXAMPLE_MODULE = 'altair.examples'
 
 
 GALLERY_TEMPLATE = jinja2.Template(u"""
@@ -33,6 +35,12 @@ GALLERY_TEMPLATE = jinja2.Template(u"""
 This gallery contains a selection of examples of the plots Altair can create.
 
 Some may seem fairly complicated at first glance, but they are built by combining a simple set of declarative building blocks.
+
+Many draw upon sample datasets compiled by the `Vega <https://vega.github.io/vega/>`_ project. To access them yourself, install `vega_datasets <https://github.com/altair-viz/vega_datasets>`_.
+
+.. code-block:: none
+
+   $ pip install vega_datasets
 
 {% for grouper, group in examples %}
 
@@ -115,13 +123,17 @@ def save_example_pngs(examples, image_dir, make_thumbnails=True):
         hashes_match = (hashes.get(filename, '') == example_hash)
 
         if hashes_match and os.path.exists(image_file):
-            print('-> using cached {0}'.format(image_file))
+            print('-> using cached {}'.format(image_file))
         else:
             # the file changed or the image file does not exist. Generate it.
-            print('-> saving {0}'.format(image_file))
+            print('-> saving {}'.format(image_file))
             chart = eval_block(example['code'])
-            chart.save(image_file)
-            hashes[filename] = example_hash
+            try:
+                chart.save(image_file)
+                hashes[filename] = example_hash
+            except ImportError:
+                warnings.warn("Could not import selenium: using generic image")
+                create_generic_image(image_file)
 
             with open(hash_file, 'w') as f:
                 json.dump(hashes, f)
@@ -146,7 +158,7 @@ def populate_examples(**kwds):
             get_docstring_and_rest(example['filename'])
         example.update(kwds)
         if category is None:
-            category = 'general'
+            category = 'other charts'
         example.update({'docstring': docstring,
                         'title': docstring.strip().split('\n')[0],
                         'code': code,
@@ -238,6 +250,7 @@ def main(app):
         'Histograms': [],
         'Maps': [],
         'Interactive Charts': [],
+        'Case Studies': [],
         'Other Charts': []
     })
     for d in examples:

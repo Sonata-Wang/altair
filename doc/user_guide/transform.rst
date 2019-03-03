@@ -27,13 +27,13 @@ methods of top-level objects:
 =========================================  ================================================================================
 Method                                     Description
 =========================================  ================================================================================
-:meth:`~Chart.transform`                   Generic transform; passes keywords to any of the following methods.
 :meth:`~Chart.transform_aggregate`         Create a new data column by aggregating an existing column.
 :meth:`~Chart.transform_bin`               Create a new data column by binning an existing column.
 :meth:`~Chart.transform_calculate`         Create a new data column using an arithmetic calculation on an existing column.
 :meth:`~Chart.transform_filter`            Select a subset of data based on a condition.
 :meth:`~Chart.transform_lookup`            One-sided join of two datasets based on a lookup key.
 :meth:`~Chart.transform_timeunit`          Discretize/group a date by a time unit (day, month, year, etc.)
+:meth:`~Chart.transform_window`            Compute a windowed aggregation
 =========================================  ================================================================================
 
 We will see some examples of these transforms in the following sections.
@@ -250,7 +250,9 @@ expressions and objects:
 
 1. A `Vega expression`_ expressed as a string or built using the :mod:`~expr` module
 2. A Field predicate, such as :class:`~FieldOneOfPredicate`,
-   :class:`~FieldRangePredicate`, or :class:`~FieldEqualPredicate`
+   :class:`~FieldRangePredicate`, :class:`~FieldEqualPredicate`,
+   :class:`~FieldLTPredicate`, :class:`~FieldGTPredicate`,
+   :class:`~FieldLTEPredicate`, :class:`~FieldGTEPredicate`,
 3. A Selection predicate or object created by :func:`selection`
 4. A Logical operand that combines any of the above
 
@@ -294,8 +296,16 @@ are:
   specified values.
 - :class:`~FieldRangePredicate` evaluates whether a continuous field is within
   a range of values.
+- :class:`~FieldLTPredicate` evaluates whether a continuous field is less
+  than a given value
+- :class:`~FieldGTPredicate` evaluates whether a continuous field is greater
+  than a given value
+- :class:`~FieldLTEPredicate` evaluates whether a continuous field is less
+  than or equal to a given value
+- :class:`~FieldGTEPredicate` evaluates whether a continuous field is greater
+  than or equal to a given value
 
-Here is an examaple of a :class:`~FieldEqualPredicate` used to select just the
+Here is an example of a :class:`~FieldEqualPredicate` used to select just the
 values from year 2000 as in the above chart:
 
 .. altair-plot::
@@ -586,23 +596,24 @@ measurements in Seattle during the year 2010:
 
 The plot is too busy due to the amount of data points squeezed into the short
 time; we can make it a bit cleaner by discretizing it, for example, by month
-(``timeUnit="month"``) and plotting only the mean monthly temperature:
+and plotting only the mean monthly temperature:
 
 .. altair-plot::
 
     alt.Chart(temps).mark_line().encode(
-        alt.X('date:T', timeUnit='month'),
+        x='month(date):T',
         y='mean(temp):Q'
     )
 
 Notice that by default timeUnit output is a continuous quantity; if you would
-instead like it to be a categorical, you can specify the ordinal type.
+instead like it to be a categorical, you can specify the ordinal (``O``) or
+nominal (``N``) type.
 This can be useful when plotting a bar chart or other discrete chart type:
 
 .. altair-plot::
 
     alt.Chart(temps).mark_bar().encode(
-        alt.X('date:O', timeUnit='month'),
+        x='month(date):O',
         y='mean(temp):Q'
     )
 
@@ -613,8 +624,8 @@ to give a profile of Seattle temperatures through the year:
 .. altair-plot::
 
     alt.Chart(temps).mark_rect().encode(
-        alt.X('date:O', timeUnit='date', axis=alt.Axis(title='day')),
-        alt.Y('date:O', timeUnit='month', axis=alt.Axis(title='month')),
+        alt.X('date(date):O', title='day'),
+        alt.Y('month(date):O', title='month'),
         color='max(temp):Q'
     ).properties(
         title="2010 Daily High Temperatures in Seattle (F)"
@@ -633,11 +644,103 @@ method. For example:
         alt.X('month:T', axis=alt.Axis(format='%b')),
         y='mean(temp):Q'
     ).transform_timeunit(
-        "month", field="date", timeUnit="month"
+        month='month(date)'
     )
 
 Notice that because the ``timeUnit`` is not part of the encoding channel here,
 it is often necessary to add an axis formatter to ensure appropriate axis
 labels.
 
+
+.. _user-guide-window-transform:
+
+Window Transform
+~~~~~~~~~~~~~~~~
+The window transform performs calculations over sorted groups of data objects.
+These calculations include ranking, lead/lag analysis, and aggregates such as cumulative sums and averages.
+Calculated values are written back to the input data stream, where they can be referenced by encodings.
+
+For example, consider the following cumulative frequency distribution:
+
+.. altair-plot::
+
+    import altair as alt
+    from vega_datasets import data
+
+    alt.Chart(data.movies.url).transform_window(
+        sort=[{'field': 'IMDB_Rating'}],
+        frame=[None, 0],
+        cumulative_count='count(*)',
+    ).mark_area().encode(
+        x='IMDB_Rating:Q',
+        y='cumulative_count:Q',
+    )
+
+First, we pass a sort field definition, which indicates how data objects should be sorted within the window.
+Here, movies should be sorted by their IMDB rating.
+Next, we pass the frame, which indicates how many data objects before and after the current data object should be included within the window.
+Here, all movies up to and including the current movie should be included.
+Finally, we pass a window field definition, which indicates how data objects should be aggregated within the window.
+Here, the number of movies should be counted.
+
+There are many aggregation functions built into Altair.
+As well as those given in :ref:`encoding-aggregates`, we can use the following within window field definitions:
+
+============  =========  =========================================================================================================================================================================================================================================================================================================================
+Aggregate     Parameter  Description
+============  =========  =========================================================================================================================================================================================================================================================================================================================
+row_number    None       Assigns each data object a consecutive row number, starting from 1.
+rank          None       Assigns a rank order value to each data object in a window, starting from 1. Peer values are assigned the same rank. Subsequent rank scores incorporate the number of prior values. For example, if the first two values tie for rank 1, the third value is assigned rank 3.
+dense_rank    None       Assigns dense rank order values to each data object in a window, starting from 1. Peer values are assigned the same rank. Subsequent rank scores do not incorporate the number of prior values. For example, if the first two values tie for rank 1, the third value is assigned rank 2.
+percent_rank  None       Assigns a percentage rank order value to each data object in a window. The percent is calculated as (rank - 1) / (group_size - 1).
+cume_dist     None       Assigns a cumulative distribution value between 0 and 1 to each data object in a window.
+ntile         Number     Assigns a quantile (e.g., percentile) value to each data object in a window. Accepts an integer parameter indicating the number of buckets to use (e.g., 100 for percentiles, 5 for quintiles).
+lag           Number     Assigns a value from the data object that precedes the current object by a specified number of positions. If no such object exists, assigns ``null``. Accepts an offset parameter (default ``1``) that indicates the number of positions. This operation must have a corresponding entry in the `fields` parameter array.
+lead          Number     Assigns a value from the data object that follows the current object by a specified number of positions. If no such object exists, assigns ``null``. Accepts an offset parameter (default ``1``) that indicates the number of positions. This operation must have a corresponding entry in the `fields` parameter array.
+first_value   None       Assigns a value from the first data object in the current sliding window frame. This operation must have a corresponding entry in the `fields` parameter array.
+last_value    None       Assigns a value from the last data object in the current sliding window frame. This operation must have a corresponding entry in the `fields` parameter array.
+nth_value     Number     Assigns a value from the nth data object in the current sliding window frame. If no such object exists, assigns ``null``. Requires a non-negative integer parameter that indicates the offset from the start of the window frame. This operation must have a corresponding entry in the `fields` parameter array.
+============  =========  =========================================================================================================================================================================================================================================================================================================================
+
+While an aggregate transform computes a single value that summarises all data objects, a window transform adds a new property to each data object.
+This new property is computed from the neighbouring data objects: that is, from the data objects delimited by the window field definition.
+For example, consider the following time series of stock prices:
+
+.. altair-plot::
+
+    import altair as alt
+    from vega_datasets import data
+
+    alt.Chart(data.stocks.url).mark_line().encode(
+        x='date:T',
+        y='price:Q',
+        color='symbol:N',
+    )
+
+It's hard to see the overall pattern in the above example, because Google's stock price is much higher than the other stock prices.
+If we plot the `z-scores`_ of the stock prices, rather than the stock prices themselves, then the overall pattern becomes clearer:
+
+.. altair-plot::
+
+    import altair as alt
+    from vega_datasets import data
+
+    alt.Chart(data.stocks.url).transform_window(
+        mean_price='mean(price)',
+        stdev_price='stdev(price)',
+        frame=[None, None],
+        groupby=['symbol'],
+    ).transform_calculate(
+        z_score=(alt.datum.price - alt.datum.mean_price) / alt.datum.stdev_price,
+    ).mark_line().encode(
+        x='date:T',
+        y='z_score:Q',
+        color='symbol:N',
+    )
+
+By using two aggregation functions (``mean`` and ``stdev``) within the window transform, we are able to compute the z-scores within the calculate transform.
+
+For more information about the arguments to the window transform, see :class:`WindowTransform` and `the Vega-Lite documentation <https://vega.github.io/vega-lite/docs/window.html>`_.
+
 .. _Vega expression: https://vega.github.io/vega/docs/expressions/
+.. _z-scores: https://en.wikipedia.org/w/index.php?title=Z-score

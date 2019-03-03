@@ -6,11 +6,6 @@ import contextlib
 import os
 import tempfile
 
-try:
-    import selenium.webdriver
-except ImportError:
-    selenium = None
-
 
 @contextlib.contextmanager
 def temporary_filename(**kwargs):
@@ -49,8 +44,9 @@ HTML_TEMPLATE = """
 EXTRACT_CODE = {
 'png': """
         var spec = arguments[0];
-        var mode = arguments[1]
-        var done = arguments[2];
+        var mode = arguments[1];
+        var scaleFactor = arguments[2];
+        var done = arguments[3];
 
         if(mode === 'vega-lite'){
           // compile vega-lite to vega
@@ -64,7 +60,7 @@ EXTRACT_CODE = {
               renderer: 'none',
             })
             .initialize()
-            .toCanvas()
+            .toCanvas(scaleFactor)
             .then(function(canvas){return canvas.toDataURL('image/png');})
             .then(done)
             .catch(function(err) { console.error(err); });
@@ -72,7 +68,8 @@ EXTRACT_CODE = {
 'svg': """
         var spec = arguments[0];
         var mode = arguments[1];
-        var done = arguments[2];
+        var scaleFactor = arguments[2];
+        var done = arguments[3];
 
         if(mode === 'vega-lite'){
           // compile vega-lite to vega
@@ -86,14 +83,14 @@ EXTRACT_CODE = {
               renderer: 'none',
             })
             .initialize()
-            .toSVG()
+            .toSVG(scaleFactor)
             .then(done)
             .catch(function(err) { console.error(err); });
         """,
 'vega': """
         var spec = arguments[0];
         var mode = arguments[1];
-        var done = arguments[2];
+        var done = arguments[3];
 
         if(mode === 'vega-lite'){
           // compile vega-lite to vega
@@ -107,8 +104,15 @@ EXTRACT_CODE = {
 
 def compile_spec(spec, format, mode,
                  vega_version, vegaembed_version, vegalite_version,
-                 driver_timeout=10, webdriver='chrome'):
+                 scale_factor=1, driver_timeout=20, webdriver='chrome'):
     # TODO: detect & use local Jupyter caches of JS packages?
+
+    # selenium is an optional dependency, so import it here
+    try:
+        import selenium.webdriver
+    except ImportError:
+        raise ImportError("selenium package is required "
+                          "for saving chart as {}".format(format))
 
     if format not in ['png', 'svg', 'vega']:
         raise NotImplementedError("format must be 'svg', 'png' or 'vega'")
@@ -125,9 +129,6 @@ def compile_spec(spec, format, mode,
     if mode == 'vega-lite' and vegalite_version is None:
         raise ValueError("must specify vega-lite version")
 
-    if selenium is None:
-        raise ImportError("selenium package is required "
-                          "for saving chart as {0}".format(format))
     if webdriver == 'chrome':
         webdriver_class = selenium.webdriver.Chrome
         webdriver_options_class = selenium.webdriver.chrome.options.Options
@@ -162,8 +163,8 @@ def compile_spec(spec, format, mode,
             online = driver.execute_script("return navigator.onLine")
             if not online:
                 raise ValueError("Internet connection required for saving "
-                                 "chart as {0}".format(format))
+                                 "chart as {}".format(format))
             return driver.execute_async_script(EXTRACT_CODE[format],
-                                               spec, mode)
+                                               spec, mode, scale_factor)
     finally:
         driver.close()

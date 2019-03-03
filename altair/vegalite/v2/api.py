@@ -2,6 +2,8 @@
 
 import warnings
 
+import hashlib
+import json
 import jsonschema
 import six
 import pandas as pd
@@ -15,20 +17,86 @@ from .theme import themes
 
 # ------------------------------------------------------------------------
 # Data Utilities
-def _prepare_data(data):
-    """Convert input data to data for use within schema"""
+def _dataset_name(values):
+    """Generate a unique hash of the data
+
+    Parameters
+    ----------
+    values : list or dict
+        A list/dict representation of data values.
+
+    Returns
+    -------
+    name : string
+        A unique name generated from the hash of the values.
+    """
+    if isinstance(values, core.InlineDataset):
+        values = values.to_dict()
+    values_json = json.dumps(values, sort_keys=True)
+    hsh = hashlib.md5(values_json.encode()).hexdigest()
+    return 'data-' + hsh
+
+
+def _consolidate_data(data, context):
+    """If data is specified inline, then move it to context['datasets']
+
+    This function will modify context in-place, and return a new version of data
+    """
+    values = Undefined
+    kwds = {}
+
+    if isinstance(data, core.InlineData):
+        if data.name is Undefined and data.values is not Undefined:
+            values = data.values
+            kwds = {'format': data.format}
+
+    elif isinstance(data, dict):
+        if 'name' not in data and 'values' in data:
+            values = data['values']
+            kwds = {k:v for k,v in data.items() if k != 'values'}
+
+    if values is not Undefined:
+        name = _dataset_name(values)
+        data = core.NamedData(name=name, **kwds)
+        context.setdefault('datasets', {})[name] = values
+
+    return data
+
+
+def _prepare_data(data, context):
+    """Convert input data to data for use within schema
+
+    Parameters
+    ----------
+    data :
+        The input dataset in the form of a DataFrame, dictionary, altair data
+        object, or other type that is recognized by the data transformers.
+    context : dict
+        The to_dict context in which the data is being prepared. This is used
+        to keep track of information that needs to be passed up and down the
+        recursive serialization routine, such as global named datasets.
+    """
     if data is Undefined:
         return data
-    elif isinstance(data, (dict, core.Data, core.InlineData,
-                         core.UrlData, core.NamedData)):
-        return data
-    elif isinstance(data, pd.DataFrame):
-        return pipe(data, data_transformers.get())
-    elif isinstance(data, six.string_types):
-        return core.UrlData(data)
-    else:
-        warnings.warn("data of type {0} not recognized".format(type(data)))
-        return data
+
+    # convert dataframes to dict
+    if isinstance(data, pd.DataFrame):
+        data = pipe(data, data_transformers.get())
+
+    # convert string input to a URLData
+    if isinstance(data, six.string_types):
+        data = core.UrlData(data)
+
+    # consolidate inline data to top-level datasets
+    if data_transformers.consolidate_datasets:
+        data = _consolidate_data(data, context)
+
+    # if data is still not a recognized type, then return
+    if not isinstance(data, (dict, core.Data, core.UrlData,
+                             core.InlineData, core.NamedData)):
+        warnings.warn("data of type {} not recognized".format(type(data)))
+
+    return data
 
 
 # ------------------------------------------------------------------------
@@ -40,7 +108,8 @@ class LookupData(core.LookupData):
     def to_dict(self, *args, **kwargs):
         """Convert the chart to a dictionary suitable for JSON export"""
         copy = self.copy(ignore=['data'])
-        copy.data = _prepare_data(copy.data)
+        context = kwargs.get('context', {})
+        copy.data = _prepare_data(copy.data, context)
         return super(LookupData, copy).to_dict(*args, **kwargs)
 
 
@@ -132,6 +201,7 @@ class NamedSelection(SelectionMapping):
         >>> sel = alt.selection_interval(name='interval')
         >>> sel.ref()
         {'selection': 'interval'}
+
         """
         return {"selection": self._get_name()}
 
@@ -185,7 +255,7 @@ def selection(name=None, type=Undefined, **kwds):
         The selection object that can be used in chart creation.
     """
     if name is None:
-        name = "selector{0:03d}".format(selection.counter)
+        name = "selector{:03d}".format(selection.counter)
         selection.counter += 1
     return NamedSelection(**{name: core.SelectionDef(type=type, **kwds)})
 
@@ -263,7 +333,11 @@ def condition(predicate, if_true, if_false, **kwargs):
                             core.SelectionAnd, core.SelectionOperand)
     test_predicates = (six.string_types, expr.Expression, core.Predicate,
                        core.LogicalOperandPredicate, core.LogicalNotPredicate,
-                       core.LogicalOrPredicate, core.LogicalAndPredicate)
+                       core.LogicalOrPredicate, core.LogicalAndPredicate,
+                       core.FieldEqualPredicate, core.FieldOneOfPredicate,
+                       core.FieldRangePredicate, core.FieldLTPredicate,
+                       core.FieldGTPredicate, core.FieldLTEPredicate,
+                       core.FieldGTEPredicate, core.SelectionPredicate)
 
     if isinstance(predicate, NamedSelection):
         condition = {'selection': predicate._get_name()}
@@ -274,7 +348,7 @@ def condition(predicate, if_true, if_false, **kwargs):
     elif isinstance(predicate, dict):
         condition = predicate
     else:
-        raise NotImplementedError("condition predicate of type {0}"
+        raise NotImplementedError("condition predicate of type {}"
                                   "".format(type(predicate)))
 
     if isinstance(if_true, core.SchemaBase):
@@ -309,22 +383,29 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
     def to_dict(self, *args, **kwargs):
         """Convert the chart to a dictionary suitable for JSON export"""
-        copy = self.copy()
-        original_data = getattr(copy, 'data', Undefined)
-        copy.data = _prepare_data(original_data)
-
-        # We make use of two context markers:
+        # We make use of three context markers:
         # - 'data' points to the data that should be referenced for column type
         #   inference.
         # - 'top_level' is a boolean flag that is assumed to be true; if it's
         #   true then a "$schema" arg is added to the dict.
-        context = kwargs.get('context', {}).copy()
+        # - 'datasets' is a dict of named datasets that should be inserted
+        #   in the top-level object
 
+        # note: not a deep copy because we want datasets and data arguments to
+        # be passed by reference
+        context = kwargs.get('context', {}).copy()
+        context.setdefault('datasets', {})
         is_top_level = context.get('top_level', True)
-        context['top_level'] = False
+
+        copy = self.copy()
+        original_data = getattr(copy, 'data', Undefined)
+        copy.data = _prepare_data(original_data, context)
 
         if original_data is not Undefined:
             context['data'] = original_data
+
+        # remaining to_dict calls are not at top level
+        context['top_level'] = False
         kwargs['context'] = context
 
         try:
@@ -339,6 +420,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             kwargs['validate'] = 'deep'
             dct = super(TopLevelMixin, copy).to_dict(*args, **kwargs)
 
+        # TODO: following entries are added after validation. Should they be validated?
         if is_top_level:
             # since this is top-level we add $schema if it's missing
             if '$schema' not in dct:
@@ -348,7 +430,22 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             the_theme = themes.get()
             dct = utils.update_nested(the_theme(), dct, copy=True)
 
+            # update datasets
+            if context['datasets']:
+                dct.setdefault('datasets', {}).update(context['datasets'])
+
         return dct
+
+    def to_html(self, base_url="https://cdn.jsdelivr.net/npm/",
+                output_div='vis', embed_options=None, json_kwds=None,
+                fullhtml=True, requirejs=False):
+        return utils.spec_to_html(self.to_dict(), mode='vega-lite',
+                                  vegalite_version=VEGALITE_VERSION,
+                                  vegaembed_version=VEGAEMBED_VERSION,
+                                  vega_version=VEGA_VERSION,
+                                  base_url=base_url, output_div=output_div,
+                                  embed_options=embed_options, json_kwds=json_kwds,
+                                  fullhtml=fullhtml, requirejs=requirejs)
 
     def savechart(self, fp, format=None, **kwargs):
         """Save a chart to file in a variety of formats
@@ -365,6 +462,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         **kwargs :
             Additional keyword arguments are passed to the output method
             associated with the specified format.
+
         """
         warnings.warn(
             "Chart.savechart is deprecated in favor of Chart.save",
@@ -372,7 +470,12 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         )
         return self.save(fp, format=None, **kwargs)
 
-    def save(self, fp, format=None, override_data_transformer=True, **kwargs):
+    def save(self, fp, format=None, override_data_transformer=True,
+             scale_factor=1.0,
+             vegalite_version=VEGALITE_VERSION,
+             vega_version=VEGA_VERSION,
+             vegaembed_version=VEGAEMBED_VERSION,
+             **kwargs):
         """Save a chart to file in a variety of formats
 
         Supported formats are json, html, png, svg
@@ -388,21 +491,27 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             If True (default), then the save action will be done with the
             default data_transformer with max_rows set to None. If False,
             then use the currently active data transformer.
+        scale_factor : float
+            For svg or png formats, scale the image by this factor when saving.
+            This can be used to control the size or resolution of the output.
+            Default is 1.0
         **kwargs :
             Additional keyword arguments are passed to the output method
             associated with the specified format.
+
         """
         from ...utils.save import save
 
         kwds = dict(chart=self, fp=fp, format=format,
-                    vegalite_version=VEGALITE_VERSION,
-                    vega_version=VEGA_VERSION,
-                    vegaembed_version=VEGAEMBED_VERSION,
+                    scale_factor=scale_factor,
+                    vegalite_version=vegalite_version,
+                    vega_version=vega_version,
+                    vegaembed_version=vegaembed_version,
                     **kwargs)
 
         # By default we override the data transformer. This makes it so
         # that save() will succeed even for large datasets that would
-        # normally trigger a MaxBinsError
+        # normally trigger a MaxRowsError
         if override_data_transformer:
             with data_transformers.enable('default', max_rows=None):
                 result = save(**kwds)
@@ -421,20 +530,6 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
     def __or__(self, other):
         return HConcatChart(hconcat=[self, other])
 
-    # Display-related methods
-
-    def _repr_mimebundle_(self, include, exclude):
-        """Return a MIME bundle for display in Jupyter frontends."""
-        # Catch errors explicitly to get around issues in Jupyter frontend
-        # see https://github.com/ipython/ipython/issues/11038
-        try:
-            dct = self.to_dict()
-        except Exception:
-            utils.display_traceback(in_ipython=True)
-            return {}
-        else:
-            return renderers.get()(dct)
-
     def repeat(self, row=Undefined, column=Undefined, **kwargs):
         """Return a RepeatChart built from the chart
 
@@ -452,6 +547,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         -------
         chart : RepeatChart
             a repeated chart.
+
         """
         repeat = core.Repeat(row=row, column=column)
         return RepeatChart(spec=self, repeat=repeat, **kwargs)
@@ -466,6 +562,18 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             setattr(copy, key, val)
         return copy
 
+    def add_selection(self, *selections):
+        """Add one or more selections to the chart"""
+        if not selections:
+            return self
+        else:
+            copy = self.copy(deep=True, ignore=['data'])
+            if copy.selection is Undefined:
+                copy.selection = SelectionMapping()
+            for selection in selections:
+                copy.selection += selection
+            return copy
+
     def project(self, type='mercator', center=Undefined, clipAngle=Undefined, clipExtent=Undefined,
                 coefficient=Undefined, distance=Undefined, fraction=Undefined, lobes=Undefined,
                 parallel=Undefined, precision=Undefined, radius=Undefined, ratio=Undefined,
@@ -477,8 +585,8 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
         Available projection types are
         ['albers', 'albersUsa', 'azimuthalEqualArea', 'azimuthalEquidistant',
-         'conicConformal', 'conicEqualArea', 'conicEquidistant', 'equirectangular',
-         'gnomonic', 'mercator', 'orthographic', 'stereographic', 'transverseMercator']
+        'conicConformal', 'conicEqualArea', 'conicEquidistant', 'equirectangular',
+        'gnomonic', 'mercator', 'orthographic', 'stereographic', 'transverseMercator']
 
         Attributes
         ----------
@@ -487,10 +595,13 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             `"albers"` and `"Albers"` indicate the same projection type. You can find all valid
             projection types [in the
             documentation](https://vega.github.io/vega-lite/docs/projection.html#projection-types).
-              __Default value:__ `mercator`
+
+            **Default value:** `mercator`
         center : List(float)
             Sets the projection’s center to the specified center, a two-element array of
-            longitude and latitude in degrees.  __Default value:__ `[0, 0]`
+            longitude and latitude in degrees.
+
+            **Default value:** `[0, 0]`
         clipAngle : float
             Sets the projection’s clipping circle radius to the specified angle in degrees. If
             `null`, switches to [antimeridian](http://bl.ocks.org/mbostock/3788999) cutting
@@ -525,10 +636,13 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
             Sets the projection’s three-axis rotation to the specified angles, which must be a
             two- or three-element array of numbers [`lambda`, `phi`, `gamma`] specifying the
             rotation angles in degrees about each spherical axis. (These correspond to yaw,
-            pitch and roll.)  __Default value:__ `[0, 0, 0]`
+            pitch and roll.)
+
+            **Default value:** `[0, 0, 0]`
         spacing : float
 
         tilt : float
+
         """
         projection = core.Projection(center=center, clipAngle=clipAngle, clipExtent=clipExtent,
                                      coefficient=coefficient, distance=distance, fraction=fraction,
@@ -552,11 +666,11 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
         Parameters
         ----------
-        aggregate : List(AggregatedFieldDef)
+        aggregate : List(:class:`AggregatedFieldDef`)
             Array of objects that define fields to aggregate.
         groupby : List(string)
-            The data fields to group by. If not specified, a single group
-            containing all data objects will be used.
+            The data fields to group by. If not specified, a single group containing all data
+            objects will be used.
         **kwds :
             additional keywords are converted to aggregates using standard
             shorthand parsing.
@@ -604,6 +718,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         See Also
         --------
         alt.AggregateTransform : underlying transform object
+
         """
         if aggregate is Undefined:
             aggregate = []
@@ -622,11 +737,11 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
         Attributes
         ----------
-        as_ : string
+        as_ : anyOf(string, List(string))
             The output fields at which to write the start and end bin values.
-        bin : anyOf(boolean, BinParams)
-            An object indicating bin properties, or simply `true` for using
-            default bin parameters.
+        bin : anyOf(boolean, :class:`BinParams`)
+            An object indicating bin properties, or simply ``true`` for using default bin
+            parameters.
         field : string
             The data field to bin.
 
@@ -660,6 +775,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         See Also
         --------
         alt.BinTransform : underlying transform object
+
         """
         if as_ is not Undefined:
             if 'as' in kwargs:
@@ -676,10 +792,11 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         Attributes
         ----------
         as_ : string
-            The output fields at which to write the start and end bin values.
+            The field for storing the computed formula value.
         calculate : string or alt.expr expression
-            An expression string. Use the variable `datum` to refer to the
-            current data object.
+            A `expression <https://vega.github.io/vega-lite/docs/types.html#expression>`__
+            string. Use the variable ``datum`` to refer to the current data object.
+
         **kwargs
             transforms can also be passed by keyword argument; see Examples
 
@@ -716,6 +833,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         See Also
         --------
         alt.CalculateTransform : underlying transform object
+
         """
         if as_ is Undefined:
             as_ = kwargs.pop('as', Undefined)
@@ -736,7 +854,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
         Attributes
         ----------
-        filter : a filter expression
+        filter : a filter expression or :class:`LogicalOperandPredicate`
             The `filter` property must be one of the predicate definitions:
             (1) a string or alt.expr expression
             (2) a range predicate
@@ -752,9 +870,14 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         See Also
         --------
         alt.FilterTransform : underlying transform object
+
         """
+        selection_predicates = (core.SelectionNot, core.SelectionOr,
+                                core.SelectionAnd, core.SelectionOperand)
         if isinstance(filter, NamedSelection):
-            filter = filter.ref()
+            filter = {'selection': filter._get_name()}
+        elif isinstance(filter, selection_predicates):
+            filter = {'selection': filter}
         return self._add_transform(core.FilterTransform(filter=filter, **kwargs))
 
     def transform_lookup(self, as_=Undefined, from_=Undefined, lookup=Undefined, default=Undefined, **kwargs):
@@ -762,17 +885,17 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
 
         Attributes
         ----------
-        as_ : string or List(string)
+        as_ : anyOf(string, List(string))
             The field or fields for storing the computed formula value.
-            If `from.fields` is specified, the transform will use the same names for `as`.
-            If `from.fields` is not specified, `as` has to be a string and we put
-            the whole object into the data under the specified name.
-        from_ : LookupData
+            If ``from.fields`` is specified, the transform will use the same names for ``as``.
+            If ``from.fields`` is not specified, ``as`` has to be a string and we put the whole
+            object into the data under the specified name.
+        from_ : :class:`LookupData`
             Secondary data reference.
         lookup : string
             Key in primary data source.
         default : string
-            The default value to use if lookup fails
+            The default value to use if lookup fails. **Default value:** ``null``
 
         Returns
         -------
@@ -782,6 +905,7 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         See Also
         --------
         alt.LookupTransform : underlying transform object
+
         """
         if as_ is not Undefined:
             if 'as' in kwargs:
@@ -802,38 +926,162 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
         Attributes
         ----------
         as_ : string
-            The output fields at which to write the start and end bin values.
+            The output field to write the timeUnit value.
         field : string
             The data field to apply time unit.
-        timeUnit : TimeUnit
+        timeUnit : :class:`TimeUnit`
             The timeUnit.
+        **kwargs
+            transforms can also be passed by keyword argument; see Examples
 
         Returns
         -------
         self : Chart object
             returns chart to allow for chaining
 
+        Examples
+        --------
+        >>> import altair as alt
+        >>> from altair import datum, expr
+
+        >>> chart = alt.Chart().transform_timeunit(month='month(date)')
+        >>> chart.transform[0]
+        TimeUnitTransform({
+          as: 'month',
+          field: 'date',
+          timeUnit: 'month'
+        })
+
+        It's also possible to pass the ``TimeUnitTransform`` arguments directly;
+        this is most useful in cases where the desired field name is not a
+        valid python identifier:
+
+        >>> kwds = {'as': 'month', 'timeUnit': 'month', 'field': 'The Month'}
+        >>> chart = alt.Chart().transform_timeunit(**kwds)
+        >>> chart.transform[0]
+        TimeUnitTransform({
+          as: 'month',
+          field: 'The Month',
+          timeUnit: 'month'
+        })
+
+        As the first form is easier to write and understand, that is the
+        recommended method.
+
         See Also
         --------
         alt.TimeUnitTransform : underlying transform object
+
         """
-        if as_ is not Undefined:
+        if as_ is Undefined:
+            as_ = kwargs.pop('as', Undefined)
+        else:
             if 'as' in kwargs:
                 raise ValueError("transform_timeunit: both 'as_' and 'as' passed as arguments.")
-            kwargs['as'] = as_
-        kwargs['field'] = field
-        kwargs['timeUnit'] = timeUnit
-        return self._add_transform(core.TimeUnitTransform(**kwargs))
+        if as_ is not Undefined:
+            dct = {'as': as_, 'timeUnit': timeUnit, 'field': field}
+            self = self._add_transform(core.TimeUnitTransform(**dct))
+        for as_, shorthand in kwargs.items():
+            dct = utils.parse_shorthand(shorthand,
+                                        parse_timeunits=True,
+                                        parse_aggregates=False,
+                                        parse_types=False)
+            dct.pop('type', None)
+            dct['as'] = as_
+            if 'timeUnit' not in dct:
+                raise ValueError("'{}' must include a valid timeUnit".format(shorthand))
+            self = self._add_transform(core.TimeUnitTransform(**dct))
+        return self
 
-    @utils.use_signature(core.WindowTransform)
-    def transform_window(self, *args, **kwargs):
-        return self._add_transform(core.WindowTransform(*args, **kwargs))
+    def transform_window(self, window=Undefined, frame=Undefined, groupby=Undefined,
+                         ignorePeers=Undefined, sort=Undefined, **kwargs):
+        """Add a WindowTransform to the schema
+
+        Attributes
+        ----------
+        window : List(:class:`WindowFieldDef`)
+            The definition of the fields in the window, and what calculations to use.
+        frame : List(anyOf(None, float))
+            A frame specification as a two-element array indicating how the sliding window
+            should proceed. The array entries should either be a number indicating the offset
+            from the current data object, or null to indicate unbounded rows preceding or
+            following the current data object. The default value is ``[null, 0]``, indicating
+            that the sliding window includes the current object and all preceding objects. The
+            value ``[-5, 5]`` indicates that the window should include five objects preceding
+            and five objects following the current object. Finally, ``[null, null]`` indicates
+            that the window frame should always include all data objects. The only operators
+            affected are the aggregation operations and the ``first_value``, ``last_value``, and
+            ``nth_value`` window operations. The other window operations are not affected by
+            this.
+
+            **Default value:** :  ``[null, 0]`` (includes the current object and all preceding
+            objects)
+        groupby : List(string)
+            The data fields for partitioning the data objects into separate windows. If
+            unspecified, all data points will be in a single group.
+        ignorePeers : boolean
+            Indicates if the sliding window frame should ignore peer values. (Peer values are
+            those considered identical by the sort criteria). The default is false, causing the
+            window frame to expand to include all peer values. If set to true, the window frame
+            will be defined by offset values only. This setting only affects those operations
+            that depend on the window frame, namely aggregation operations and the first_value,
+            last_value, and nth_value window operations.
+
+            **Default value:** ``false``
+        sort : List(:class:`SortField`)
+            A sort field definition for sorting data objects within a window. If two data
+            objects are considered equal by the comparator, they are considered “peer” values of
+            equal rank. If sort is not specified, the order is undefined: data objects are
+            processed in the order they are observed and none are considered peers (the
+            ignorePeers parameter is ignored and treated as if set to ``true`` ).
+        **kwargs
+            transforms can also be passed by keyword argument; see Examples
+
+        Examples
+        --------
+        A cumulative line chart
+
+        >>> import altair as alt
+        >>> import numpy as np
+        >>> import pandas as pd
+        >>> data = pd.DataFrame({'x': np.arange(100),
+        ...                      'y': np.random.randn(100)})
+        >>> chart = alt.Chart(data).mark_line().encode(
+        ...     x='x:Q',
+        ...     y='ycuml:Q'
+        ... ).transform_window(
+        ...     ycuml='sum(y)'
+        ... )
+        >>> chart.transform[0]
+        WindowTransform({
+          window: [WindowFieldDef({
+            as: 'ycuml',
+            field: 'y',
+            op: 'sum'
+          })]
+        })
+
+        """
+        if kwargs:
+            if window is Undefined:
+                window = []
+            for as_, shorthand in kwargs.items():
+                kwds = {'as': as_}
+                kwds.update(utils.parse_shorthand(shorthand,
+                                                  parse_aggregates=False,
+                                                  parse_window_ops=True,
+                                                  parse_timeunits=False,
+                                                  parse_types=False))
+                window.append(core.WindowFieldDef(**kwds))
+
+        return self._add_transform(core.WindowTransform(window=window, frame=frame, groupby=groupby,
+                                                        ignorePeers=ignorePeers, sort=sort))
 
     @utils.use_signature(core.Resolve)
     def _set_resolve(self, **kwargs):
         """Copy the chart and update the resolve property with kwargs"""
         if not hasattr(self, 'resolve'):
-            raise ValueError("{0} object has no attribute "
+            raise ValueError("{} object has no attribute "
                              "'resolve'".format(self.__class__))
         copy = self.copy()
         if copy.resolve is Undefined:
@@ -854,20 +1102,117 @@ class TopLevelMixin(mixins.ConfigMethodMixin):
     def resolve_scale(self, *args, **kwargs):
         return self._set_resolve(scale=core.ScaleResolveMap(*args, **kwargs))
 
+    # Display-related methods
+
+    def _repr_mimebundle_(self, include, exclude):
+        """Return a MIME bundle for display in Jupyter frontends."""
+        # Catch errors explicitly to get around issues in Jupyter frontend
+        # see https://github.com/ipython/ipython/issues/11038
+        try:
+            dct = self.to_dict()
+        except Exception:
+            utils.display_traceback(in_ipython=True)
+            return {}
+        else:
+            return renderers.get()(dct)
+
+    def display(self, renderer=Undefined, theme=Undefined, actions=Undefined,
+                **kwargs):
+        """Display chart in Jupyter notebook or JupyterLab
+
+        Parameters are passed as options to vega-embed within supported frontends.
+        See https://github.com/vega/vega-embed#options for details.
+
+        Parameters
+        ----------
+        renderer : string ('canvas' or 'svg')
+            The renderer to use
+        theme : string
+            The Vega theme name to use; see https://github.com/vega/vega-themes
+        actions : bool or dict
+            Specify whether action links ("Open In Vega Editor", etc.) are
+            included in the view.
+        **kwargs :
+            Additional parameters are also passed to vega-embed as options.
+
+        """
+        from IPython.display import display
+
+        if renderer is not Undefined:
+            kwargs['renderer'] = renderer
+        if theme is not Undefined:
+            kwargs['theme'] = theme
+        if actions is not Undefined:
+            kwargs['actions'] = actions
+
+        if kwargs:
+            options = renderers.options.copy()
+            options['embed_options']= options.get('embed_options', {}).copy()
+            options['embed_options'].update(kwargs)
+            with renderers.enable(**options):
+                display(self)
+        else:
+            display(self)
+
+    def serve(self, ip='127.0.0.1', port=8888, n_retries=50, files=None,
+              jupyter_warning=True, open_browser=True, http_server=None,
+              **kwargs):
+        """Open a browser window and display a rendering of the chart
+
+        Parameters
+        ----------
+        html : string
+            HTML to serve
+        ip : string (default = '127.0.0.1')
+            ip address at which the HTML will be served.
+        port : int (default = 8888)
+            the port at which to serve the HTML
+        n_retries : int (default = 50)
+            the number of nearby ports to search if the specified port
+            is already in use.
+        files : dictionary (optional)
+            dictionary of extra content to serve
+        jupyter_warning : bool (optional)
+            if True (default), then print a warning if this is used
+            within the Jupyter notebook
+        open_browser : bool (optional)
+            if True (default), then open a web browser to the given HTML
+        http_server : class (optional)
+            optionally specify an HTTPServer class to use for showing the
+            figure. The default is Python's basic HTTPServer.
+        **kwargs :
+            additional keyword arguments passed to the save() method
+
+        """
+        from ...utils.server import serve
+
+        html = six.StringIO()
+        self.save(html, format='html', **kwargs)
+        html.seek(0)
+
+        serve(html.read(), ip=ip, port=port, n_retries=n_retries,
+              files=files, jupyter_warning=jupyter_warning,
+              open_browser=open_browser, http_server=http_server)
+
 
 class EncodingMixin(object):
     @utils.use_signature(core.EncodingWithFacet)
     def encode(self, *args, **kwargs):
         # First convert args to kwargs by inferring the class from the argument
         if args:
-            mapping = _get_channels_mapping()
+            channels_mapping = _get_channels_mapping()
             for arg in args:
-                encoding = mapping.get(type(arg), None)
+                if isinstance(arg, (list, tuple)) and len(arg) > 0:
+                    type_ = type(arg[0])
+                else:
+                    type_ = type(arg)
+
+                encoding = channels_mapping.get(type_, None)
                 if encoding is None:
-                    raise NotImplementedError("non-keyword arg of type {0}"
+                    raise NotImplementedError("non-keyword arg of type {}"
                                               "".format(type(arg)))
                 if encoding in kwargs:
-                    raise ValueError("encode: encoding {0} specified twice"
+                    raise ValueError("encode: encoding {} specified twice"
                                      "".format(encoding))
                 kwargs[encoding] = arg
 
@@ -880,13 +1225,16 @@ class EncodingMixin(object):
             if isinstance(obj, six.string_types):
                 obj = {'shorthand': obj}
 
+            if isinstance(obj, (list, tuple)):
+                return [_wrap_in_channel_class(subobj, prop) for subobj in obj]
+
             if 'value' in obj:
                 clsname += 'Value'
 
             try:
                 cls = getattr(channels, clsname)
             except AttributeError:
-                raise ValueError("Unrecognized encoding channel '{0}'".format(prop))
+                raise ValueError("Unrecognized encoding channel '{}'".format(prop))
 
             try:
                 # Don't force validation here; some objects won't be valid until
@@ -950,8 +1298,9 @@ class Chart(TopLevelMixin, EncodingMixin, mixins.MarkMethodMixin,
         content sizing and automatic resizing. `"fit"` is only supported for single and
         layered views that don't use `rangeStep`.  __Default value__: `pad`
     background : string
-        CSS color property to use as the background of visualization.  __Default value:__
-        none (transparent)
+        CSS color property to use as the background of visualization.
+
+        **Default value:** none (transparent)
     config : Config
         Vega-Lite configuration object.  This property can only be defined at the top-level
         of a specification.
@@ -987,6 +1336,25 @@ class Chart(TopLevelMixin, EncodingMixin, mixins.MarkMethodMixin,
 
     @classmethod
     def from_dict(cls, dct, validate=True):
+        """Construct class from a dictionary representation
+
+        Parameters
+        ----------
+        dct : dictionary
+            The dict from which to construct the class
+        validate : boolean
+            If True (default), then validate the input against the schema.
+
+        Returns
+        -------
+        obj : Chart object
+            The wrapped schema
+
+        Raises
+        ------
+        jsonschema.ValidationError :
+            if validate=True and dct does not conform to the schema
+        """
         # First try from_dict for the Chart type
         try:
             return super(Chart, cls).from_dict(dct, validate=validate)
@@ -1022,6 +1390,7 @@ class Chart(TopLevelMixin, EncodingMixin, mixins.MarkMethodMixin,
         -------
         chart :
             copy of self, with interactive axes added
+
         """
         encodings = []
         if bind_x:
@@ -1073,9 +1442,9 @@ def _check_if_valid_subspec(spec, classname):
 @utils.use_signature(core.TopLevelRepeatSpec)
 class RepeatChart(TopLevelMixin, core.TopLevelRepeatSpec):
     """A chart repeated across rows and columns with small changes"""
-    def __init__(self, spec=Undefined, data=Undefined, repeat=Undefined, **kwargs):
+    def __init__(self, data=Undefined, spec=Undefined, repeat=Undefined, **kwargs):
         _check_if_valid_subspec(spec, 'RepeatChart')
-        super(RepeatChart, self).__init__(spec=spec, data=data, repeat=repeat, **kwargs)
+        super(RepeatChart, self).__init__(data=data, spec=spec, repeat=repeat, **kwargs)
 
     def interactive(self, name=None, bind_x=True, bind_y=True):
         """Make chart axes scales interactive
@@ -1094,6 +1463,7 @@ class RepeatChart(TopLevelMixin, core.TopLevelRepeatSpec):
         -------
         chart :
             copy of self, with interactive axes added
+
         """
         copy = self.copy()
         copy.spec = copy.spec.interactive(name=name, bind_x=bind_x, bind_y=bind_y)
@@ -1122,11 +1492,11 @@ def repeat(repeater):
 @utils.use_signature(core.TopLevelHConcatSpec)
 class HConcatChart(TopLevelMixin, core.TopLevelHConcatSpec):
     """A chart with horizontally-concatenated facets"""
-    def __init__(self, hconcat=(), **kwargs):
+    def __init__(self, data=Undefined, hconcat=(), **kwargs):
         # TODO: move common data to top level?
         for spec in hconcat:
             _check_if_valid_subspec(spec, 'HConcatChart')
-        super(HConcatChart, self).__init__(hconcat=list(hconcat), **kwargs)
+        super(HConcatChart, self).__init__(data=data, hconcat=list(hconcat), **kwargs)
 
     def __ior__(self, other):
         _check_if_valid_subspec(other, 'HConcatChart')
@@ -1150,11 +1520,11 @@ def hconcat(*charts, **kwargs):
 @utils.use_signature(core.TopLevelVConcatSpec)
 class VConcatChart(TopLevelMixin, core.TopLevelVConcatSpec):
     """A chart with vertically-concatenated facets"""
-    def __init__(self, vconcat=(), **kwargs):
+    def __init__(self, data=Undefined, vconcat=(), **kwargs):
         # TODO: move common data to top level?
         for spec in vconcat:
             _check_if_valid_subspec(spec, 'VConcatChart')
-        super(VConcatChart, self).__init__(vconcat=list(vconcat), **kwargs)
+        super(VConcatChart, self).__init__(data=data, vconcat=list(vconcat), **kwargs)
 
     def __iand__(self, other):
         _check_if_valid_subspec(other, 'VConcatChart')
@@ -1218,6 +1588,7 @@ class LayerChart(TopLevelMixin, EncodingMixin, core.TopLevelLayerSpec):
         -------
         chart :
             copy of self, with interactive axes added
+
         """
         if not self.layer:
             raise ValueError("LayerChart: cannot call interactive() until a "
@@ -1249,9 +1620,9 @@ def layer(*charts, **kwargs):
 @utils.use_signature(core.TopLevelFacetSpec)
 class FacetChart(TopLevelMixin, core.TopLevelFacetSpec):
     """A Chart with layers within a single panel"""
-    def __init__(self, spec, facet=Undefined, **kwargs):
+    def __init__(self, data=Undefined, spec=Undefined, facet=Undefined, **kwargs):
         _check_if_valid_subspec(spec, 'FacetChart')
-        super(FacetChart, self).__init__(spec=spec, facet=facet, **kwargs)
+        super(FacetChart, self).__init__(data=data, spec=spec, facet=facet, **kwargs)
 
     def interactive(self, name=None, bind_x=True, bind_y=True):
         """Make chart axes scales interactive
@@ -1270,6 +1641,7 @@ class FacetChart(TopLevelMixin, core.TopLevelFacetSpec):
         -------
         chart :
             copy of self, with interactive axes added
+
         """
         copy = self.copy()
         copy.spec = copy.spec.interactive(name=name, bind_x=bind_x, bind_y=bind_y)
